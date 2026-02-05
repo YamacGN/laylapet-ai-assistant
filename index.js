@@ -135,6 +135,12 @@ app.post('/api/chat', async (req, res) => {
       // Mevcut markaları logla
       const uniqueVendors = [...new Set(allProducts.map(p => p.vendor).filter(v => v))];
       console.log(`🏷️ Mevcut markalar (${uniqueVendors.length}):`, uniqueVendors.slice(0, 15).join(', ') + '...');
+      
+      // Vendor boş olanları logla
+      const emptyVendorCount = allProducts.filter(p => !p.vendor).length;
+      if (emptyVendorCount > 0) {
+        console.log(`⚠️ ${emptyVendorCount} ürünün vendor alanı boş`);
+      }
     }
 
     // Akıllı filtreleme
@@ -217,6 +223,39 @@ app.post('/api/clear-cache', (req, res) => {
   res.json({ success: true, message: 'Cache temizlendi' });
 });
 
+// Vendor listesi (debug)
+app.get('/api/vendors', (req, res) => {
+  if (!productCache || productCache.length === 0) {
+    return res.json({ 
+      error: 'Cache boş, önce bir arama yapın',
+      vendors: []
+    });
+  }
+
+  const vendorList = productCache
+    .map(p => ({
+      vendor: p.vendor || '(BOŞ)',
+      title: p.title.substring(0, 60)
+    }))
+    .slice(0, 100); // İlk 100 ürün
+
+  const uniqueVendors = [...new Set(productCache.map(p => p.vendor || '(BOŞ)'))].sort();
+  
+  const emptyVendorProducts = productCache
+    .filter(p => !p.vendor)
+    .slice(0, 20)
+    .map(p => p.title.substring(0, 60));
+
+  res.json({
+    totalProducts: productCache.length,
+    uniqueVendors: uniqueVendors,
+    vendorCount: uniqueVendors.length,
+    emptyVendorCount: productCache.filter(p => !p.vendor).length,
+    sampleProducts: vendorList,
+    emptyVendorSamples: emptyVendorProducts
+  });
+});
+
 app.get('/', (req, res) => {
   const cacheAge = cacheTime ? Math.floor((Date.now() - cacheTime) / 1000) : null;
   const cacheStatus = cacheAge ? `${cacheAge}s önce güncellendi` : 'Henüz yüklenmedi';
@@ -240,7 +279,10 @@ app.get('/', (req, res) => {
           Geçerlilik: ${CACHE_DURATION / 60000} dakika
         </p>
         <p style="font-size: 12px; color: #999;">
-          v4.0 - Pagination + Cache + Vendor Search + Diversity
+          v4.1 - Title-Based Brand Search + Pagination + Cache
+        </p>
+        <p>
+          <a href="/api/vendors" style="color: #4CAF50;">Vendor Listesi</a>
         </p>
       </body>
     </html>
@@ -251,8 +293,8 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK',
     api: 'Admin API',
-    version: '4.0',
-    features: ['pagination', 'cache', 'vendor-search', 'diversity'],
+    version: '4.1',
+    features: ['pagination', 'cache', 'title-brand-search', 'vendor-search', 'diversity'],
     cache: {
       products: productCache ? productCache.length : 0,
       ageSeconds: cacheTime ? Math.floor((Date.now() - cacheTime) / 1000) : null,
@@ -267,7 +309,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`📡 Using Shopify Admin API with Pagination`);
   console.log(`💾 Cache enabled (${CACHE_DURATION / 60000} minutes)`);
-  console.log(`🏷️ Vendor-based brand search enabled`);
+  console.log(`🏷️ Title + Vendor based brand search enabled`);
   console.log(`🎲 Product diversity enabled`);
 });
 
@@ -325,12 +367,12 @@ function buildSearchTerms(message) {
   const stopWords = [
     'var', 'mi', 'mı', 'için', 'lazim', 'lazım', 'ne', 'nedir', 
     'varmı', 'var mi', 'bir', 'bu', 'şu', 'o', 've', 'ile',
-    'çok', 'az', 'iyi', 'güzel', 'ucuz', 'pahalı'
+    'çok', 'az', 'iyi', 'güzel', 'ucuz', 'pahalı', 'mnama', 'kuru'
   ];
   
   const categoryWords = [
     'kedi', 'köpek', 'kopek', 'mama', 'ödül', 'odul', 'oyuncak', 
-    'kuru', 'yaş', 'yas', 'kuş', 'kus', 'treat', 'food'
+    'yaş', 'yas', 'kuş', 'kus', 'treat', 'food'
   ];
   
   const words = msg.split(' ').filter(w => 
@@ -376,7 +418,7 @@ function buildSearchTerms(message) {
   }
   
   if (msg.includes('kuru') || msg.includes('dry') || msg.includes('kibble')) {
-    terms.special.push('kuru', 'dry', 'kibble');
+    terms.special.push('dry', 'kibble');
   }
   
   if (msg.includes('hassas') || msg.includes('sensitive')) {
@@ -416,16 +458,25 @@ function smartFilter(products, searchTerms, originalMessage) {
     const productTypeLower = p.productType.toLowerCase();
     const combined = titleLower + ' ' + allTags + ' ' + productTypeLower + ' ' + descLower;
 
-    // 1. VENDOR (MARKA) KONTROLÜ
+    // 1. MARKA KONTROLÜ (VENDOR + TITLE) - EN YÜKSEK ÖNCELİK!
     if (searchTerms.brandKeywords.length > 0) {
       searchTerms.brandKeywords.forEach(keyword => {
-        if (vendorLower === keyword) {
-          score += 50;
-        } else if (vendorLower.includes(keyword) || keyword.includes(vendorLower)) {
-          score += 40;
-        } else if (titleLower.includes(keyword)) {
-          score += 20;
-        } else if (allTags.includes(keyword)) {
+        // A) Vendor alanında eşleşme (ideal)
+        if (vendorLower && vendorLower === keyword) {
+          score += 50; // TAM EŞLEŞME
+        } else if (vendorLower && (vendorLower.includes(keyword) || keyword.includes(vendorLower))) {
+          score += 45; // KISMI EŞLEŞME
+        }
+        // B) TITLE'da marka adı geçiyor (vendor boş veya farklıysa)
+        else if (titleLower.includes(keyword)) {
+          score += 48; // YÜKSEK PUAN - Title'dan marka bul
+        }
+        // C) Tag'de geçiyor
+        else if (allTags.includes(keyword)) {
+          score += 15;
+        }
+        // D) Description'da geçiyor
+        else if (descLower.includes(keyword)) {
           score += 10;
         }
       });
@@ -507,14 +558,14 @@ function calculateScore(product, searchTerms, originalMessage) {
   const productTypeLower = product.productType.toLowerCase();
   const combined = titleLower + ' ' + allTags + ' ' + productTypeLower;
 
-  // Vendor
+  // Vendor + Title
   searchTerms.brandKeywords.forEach(keyword => {
-    if (vendorLower === keyword) {
+    if (vendorLower && vendorLower === keyword) {
       score += 50;
-    } else if (vendorLower.includes(keyword) || keyword.includes(vendorLower)) {
-      score += 40;
+    } else if (vendorLower && (vendorLower.includes(keyword) || keyword.includes(vendorLower))) {
+      score += 45;
     } else if (titleLower.includes(keyword)) {
-      score += 20;
+      score += 48;
     }
   });
 
