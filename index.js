@@ -25,7 +25,7 @@ app.post('/api/chat', async (req, res) => {
     const searchTerms = buildSearchTerms(message);
     console.log('🔍 Search terms:', searchTerms);
     
-    // 1. Shopify Admin API - Ürünleri çek (REST API)
+    // 1. Shopify Admin API - Ürünleri çek
     const shopifyRes = await fetch(
       `https://${shopDomain}/admin/api/2024-01/products.json?limit=250&status=active`,
       {
@@ -51,7 +51,7 @@ app.post('/api/chat', async (req, res) => {
       throw new Error('Shopify yanıt vermedi');
     }
 
-    // Admin API formatından GraphQL formatına çevir
+    // Admin API formatından normalize et
     const allProducts = shopifyData.products
       .filter(p => p.status === 'active')
       .map(p => ({
@@ -66,7 +66,7 @@ app.post('/api/chat', async (req, res) => {
             currencyCode: 'TRY'
           }
         },
-        description: p.body_html ? p.body_html.replace(/<[^>]*>/g, '').substring(0, 300) : '',
+        description: p.body_html ? p.body_html.replace(/<[^>]*>/g, '').substring(0, 200) : '',
         availableForSale: p.variants && p.variants.some(v => 
           (v.inventory_quantity || 0) > 0 || v.inventory_policy === 'continue'
         ),
@@ -77,20 +77,20 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`📊 Toplam ${allProducts.length} aktif ürün`);
 
-    // Kullanıcı sorgusuna göre filtrele
-    const filteredProducts = filterProducts(allProducts, searchTerms);
+    // Akıllı filtreleme
+    const filteredProducts = smartFilter(allProducts, searchTerms, message);
 
     console.log(`✅ ${filteredProducts.length} ürün filtrelendi`);
 
     if (filteredProducts.length === 0) {
       return res.json({
-        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Köpek ödülü"\n• "Yavru mama"',
+        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Köpek ödülü"\n• "Kısır kedi için mama"\n• "Yavru köpek maması"',
         products: []
       });
     }
 
-    // En fazla 15 ürünü AI'ya gönder
-    const productsForAI = filteredProducts.slice(0, 15);
+    // Maksimum 10 ürünü AI'ya gönder (hız için)
+    const productsForAI = filteredProducts.slice(0, 10);
 
     // 2. OpenAI'ya gönder
     const systemPrompt = generateSystemPrompt(productsForAI, shopDomain);
@@ -108,7 +108,7 @@ app.post('/api/chat', async (req, res) => {
           { role: 'user', content: message }
         ],
         temperature: 0.7,
-        max_tokens: 600
+        max_tokens: 500
       })
     });
 
@@ -158,9 +158,6 @@ app.get('/', (req, res) => {
           OPENAI_KEY: ${process.env.OPENAI_KEY ? '✅ Set' : '❌ Missing'}<br>
           SHOPIFY_TOKEN: ${process.env.SHOPIFY_TOKEN ? '✅ Set (Admin API)' : '❌ Missing'}
         </p>
-        <p style="font-size: 12px; color: #999;">
-          Using Shopify Admin API (REST)
-        </p>
       </body>
     </html>
   `);
@@ -187,7 +184,8 @@ function buildSearchTerms(message) {
   const terms = {
     animal: null,
     category: null,
-    tags: []
+    special: [],
+    keywords: []
   };
 
   // Hayvan türü
@@ -200,113 +198,171 @@ function buildSearchTerms(message) {
   // Kategori
   if (msg.includes('mama')) {
     terms.category = 'mama';
-    terms.tags.push('mama');
   } else if (msg.includes('ödül') || msg.includes('odul') || msg.includes('treat')) {
     terms.category = 'ödül';
-    terms.tags.push('ödül', 'treat');
   } else if (msg.includes('oyuncak')) {
     terms.category = 'oyuncak';
-    terms.tags.push('oyuncak');
   }
 
-  // Özel özellikler
+  // Yaş aralığı tespiti (sayısal)
+  const ageMatch = msg.match(/(\d+)\s*(yaş|yas|yaşında|yasinda|aylık|aylik)/);
+  if (ageMatch) {
+    const age = parseInt(ageMatch[1]);
+    
+    if (age < 1 || msg.includes('aylık') || msg.includes('aylik')) {
+      terms.special.push('yavru', 'kitten', 'puppy', 'junior');
+    } else if (age >= 7) {
+      terms.special.push('yaşlı', 'senior', '7+', 'mature');
+    } else {
+      terms.special.push('yetişkin', 'adult');
+    }
+  }
+
+  // Özel durumlar
+  if (msg.includes('kısır') || msg.includes('kisir') || msg.includes('steril') || msg.includes('neutered')) {
+    terms.special.push('kısır', 'sterilised', 'neutered', 'steril');
+  }
+  
   if (msg.includes('yavru') || msg.includes('puppy') || msg.includes('kitten')) {
-    terms.tags.push('yavru', 'puppy', 'kitten');
+    terms.special.push('yavru', 'puppy', 'kitten', 'junior');
   }
+  
   if (msg.includes('tahılsız') || msg.includes('tahilsiz') || msg.includes('grain free')) {
-    terms.tags.push('tahılsız', 'grain free');
+    terms.special.push('tahılsız', 'grain free', 'grainfree');
   }
-  if (msg.includes('yaş') || msg.includes('wet')) {
-    terms.tags.push('yaş', 'wet');
+  
+  // YAŞLI vs YAŞ MAMA - DİKKAT!
+  if (msg.includes('yaşlı') || msg.includes('yasli') || msg.includes('senior') || msg.includes('yaşli')) {
+    terms.special.push('yaşlı', 'senior', '7+', 'mature', 'elderly');
+  } else if (msg.includes('yaş mama') || msg.includes('yas mama') || msg.includes('wet') || msg.includes('pouch')) {
+    terms.special.push('yaş', 'wet', 'pouch', 'konserve');
   }
-  if (msg.includes('kuru') || msg.includes('dry')) {
-    terms.tags.push('kuru', 'dry');
+  
+  if (msg.includes('kuru') || msg.includes('dry') || msg.includes('kibble')) {
+    terms.special.push('kuru', 'dry', 'kibble');
+  }
+  
+  if (msg.includes('hassas') || msg.includes('sensitive')) {
+    terms.special.push('hassas', 'sensitive');
+  }
+  
+  if (msg.includes('yetişkin') || msg.includes('adult')) {
+    terms.special.push('yetişkin', 'adult');
   }
 
   return terms;
 }
 
-function filterProducts(products, searchTerms) {
+function smartFilter(products, searchTerms, originalMessage) {
+  const msg = originalMessage.toLowerCase();
+  
   return products.filter(p => {
     let score = 0;
+    const titleLower = p.title.toLowerCase();
+    const descLower = p.description.toLowerCase();
+    const allTags = p.tags.map(t => t.toLowerCase()).join(' ');
+    const productTypeLower = p.productType.toLowerCase();
 
-    // Hayvan türü kontrolü (product_type veya tags)
+    // 1. Hayvan türü (zorunlu)
     if (searchTerms.animal) {
-      const typeMatch = p.productType.toLowerCase().includes(searchTerms.animal);
-      const tagMatch = p.tags.some(tag => tag.toLowerCase().includes(searchTerms.animal));
-      const titleMatch = p.title.toLowerCase().includes(searchTerms.animal);
+      const animalMatch = 
+        productTypeLower.includes(searchTerms.animal) ||
+        allTags.includes(searchTerms.animal) ||
+        titleLower.includes(searchTerms.animal);
       
-      if (typeMatch || tagMatch || titleMatch) {
-        score += 10;
-      } else {
-        return false; // Hayvan türü eşleşmezse direkt eleme
-      }
+      if (!animalMatch) return false; // Hayvan türü eşleşmezse eleme
+      score += 20;
     }
 
-    // Kategori kontrolü
+    // 2. Kategori
     if (searchTerms.category) {
-      const catMatch = p.tags.some(tag => tag.toLowerCase().includes(searchTerms.category));
-      const titleMatch = p.title.toLowerCase().includes(searchTerms.category);
-      const typeMatch = p.productType.toLowerCase().includes(searchTerms.category);
+      const catMatch = 
+        allTags.includes(searchTerms.category) ||
+        titleLower.includes(searchTerms.category) ||
+        productTypeLower.includes(searchTerms.category);
       
-      if (catMatch || titleMatch || typeMatch) {
-        score += 5;
+      if (catMatch) score += 15;
+    }
+
+    // 3. Özel durumlar (kısır, yavru, vs) - ÇOK ÖNEMLİ
+    if (searchTerms.special.length > 0) {
+      let specialMatches = 0;
+      searchTerms.special.forEach(keyword => {
+        if (titleLower.includes(keyword) || 
+            allTags.includes(keyword) || 
+            descLower.includes(keyword)) {
+          specialMatches++;
+        }
+      });
+      
+      if (specialMatches > 0) {
+        score += specialMatches * 10; // Her eşleşme +10 puan
       }
     }
 
-    // Tag kontrolü
-    searchTerms.tags.forEach(searchTag => {
-      const tagMatch = p.tags.some(tag => tag.toLowerCase().includes(searchTag.toLowerCase()));
-      const titleMatch = p.title.toLowerCase().includes(searchTag.toLowerCase());
-      
-      if (tagMatch || titleMatch) {
-        score += 3;
-      }
-    });
-
-    // Stokta olmalı
+    // 4. Stokta olmalı
     if (p.availableForSale) {
-      score += 1;
+      score += 5;
     }
 
     return score > 0;
-  }).sort((a, b) => {
-    // Fiyat karşılaştırması için score hesapla
-    return parseFloat(a.priceRange.minVariantPrice.amount) - parseFloat(b.priceRange.minVariantPrice.amount);
+  })
+  .sort((a, b) => {
+    // Skora göre sırala (en yüksek skor önce)
+    const scoreA = calculateScore(a, searchTerms);
+    const scoreB = calculateScore(b, searchTerms);
+    return scoreB - scoreA;
   });
 }
 
+function calculateScore(product, searchTerms) {
+  let score = 0;
+  const titleLower = product.title.toLowerCase();
+  const allTags = product.tags.map(t => t.toLowerCase()).join(' ');
+
+  if (searchTerms.animal && (titleLower.includes(searchTerms.animal) || allTags.includes(searchTerms.animal))) {
+    score += 20;
+  }
+  if (searchTerms.category && (titleLower.includes(searchTerms.category) || allTags.includes(searchTerms.category))) {
+    score += 15;
+  }
+  searchTerms.special.forEach(keyword => {
+    if (titleLower.includes(keyword) || allTags.includes(keyword)) {
+      score += 10;
+    }
+  });
+  
+  return score;
+}
+
 function generateSystemPrompt(products, domain) {
-  return `Sen Laylapet'in AI pet shop danışmanısın! 🐾
+  return `Sen Laylapet'in AI danışmanısın! 🐾 Türkçe konuş, profesyonel ama samimi ol.
 
-Türkçe konuş, samimi ve yardımsever ol.
-
-MEVCUT ÜRÜNLER (${products.length} adet):
+MEVCUT ÜRÜNLER (${products.length} adet - EN UYGUN OLANLAR):
 ${products.map((p, i) => `
-${i + 1}. ${p.title}
-   💰 Fiyat: ${parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2)} ${p.priceRange.minVariantPrice.currencyCode}
-   📦 Kategori: ${p.productType}
-   🏷️ Etiketler: ${p.tags.slice(0, 5).join(', ')}
-   🔗 Link: https://${domain}/products/${p.handle}
+${i + 1}. **${p.title}**
+   💰 ${parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2)} TL
+   📦 ${p.productType}
+   🏷️ ${p.tags.slice(0, 3).join(', ')}
+   🔗 https://${domain}/products/${p.handle}
 `).join('\n')}
 
 KURALLAR:
-1. ✅ SADECE yukarıdaki ürünlerden öner
-2. ✅ Maksimum 3 ürün öner
-3. ✅ Her ürün için fiyat belirt
-4. ✅ Link formatı: [Ürün Adı](https://${domain}/products/handle)
-5. ✅ Emoji kullan (🐱 🐶 🐾 💝 ⭐)
-6. ✅ Kısa ve öz yaz (maksimum 250 kelime)
-7. ✅ Ürün özelliklerini vurgula (tahılsız, yavru, vs)
+1. Maksimum 3 ürün öner
+2. Fiyatları belirt
+3. Her ürün için kısa açıklama yap (neden uygun?)
+4. Link ver: [Ürün Adı](URL)
+5. Emoji kullan ama abartma (🐱 🐶 ⭐ 💝)
+6. Maksimum 200 kelime
+7. Müşterinin tam ihtiyacına göre sırala
 
-Müşteriye en uygun ürünleri öner! 🚀`;
+ÖNEMLİ: Sadece yukarıdaki ürünlerden öner!`;
 }
 
 function extractProducts(reply, allProducts) {
   const recommended = [];
   
   allProducts.forEach(p => {
-    // Başlık veya handle eşleşmesi
     const titleMatch = reply.includes(p.title);
     const handleMatch = reply.includes(p.handle);
     
