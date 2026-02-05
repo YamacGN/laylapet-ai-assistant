@@ -26,7 +26,7 @@ app.post('/api/chat', async (req, res) => {
     console.log('🔍 Query:', query);
     
     // 1. Shopify'dan ürünleri çek
-    const shopifyRes = await fetch(`https://${shopDomain}/api/2024-01/graphql.json`, {
+    const shopifyRes = await fetch(`https://laylapet-3.myshopify.com/api/2024-01/graphql.json`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
