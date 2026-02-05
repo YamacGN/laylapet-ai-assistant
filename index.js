@@ -10,6 +10,11 @@ console.log('🚀 Server starting...');
 // Son önerileri takip et (çeşitlilik için)
 const recentRecommendations = new Map();
 
+// Ürün cache (performans için)
+let productCache = null;
+let cacheTime = null;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 dakika
+
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, shopDomain } = req.body;
@@ -28,62 +33,109 @@ app.post('/api/chat', async (req, res) => {
     const searchTerms = buildSearchTerms(message);
     console.log('🔍 Search terms:', searchTerms);
     
-    // 1. Shopify Admin API - Ürünleri çek
-    const shopifyRes = await fetch(
-      `https://${shopDomain}/admin/api/2024-01/products.json?limit=250&status=active`,
-      {
-        method: 'GET',
-        headers: {
-          'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN,
-          'Content-Type': 'application/json'
+    // 1. Shopify Admin API - TÜM ÜRÜNLERİ ÇEK (Cache veya Pagination ile)
+    let allProducts;
+    
+    if (productCache && cacheTime && (Date.now() - cacheTime < CACHE_DURATION)) {
+      console.log('⚡ Cache kullanılıyor (son güncelleme: ' + Math.floor((Date.now() - cacheTime) / 1000) + ' saniye önce)');
+      allProducts = productCache;
+    } else {
+      console.log('🔄 Tüm ürünler Shopify\'dan çekiliyor...');
+      
+      let allShopifyProducts = [];
+      let nextPageUrl = `https://${shopDomain}/admin/api/2024-01/products.json?limit=250&status=active`;
+      let pageCount = 0;
+      const maxPages = 20; // Max 5000 ürün (250 x 20)
+      
+      while (nextPageUrl && pageCount < maxPages) {
+        pageCount++;
+        console.log(`📄 Sayfa ${pageCount}/${maxPages} çekiliyor...`);
+        
+        const shopifyRes = await fetch(nextPageUrl, {
+          method: 'GET',
+          headers: {
+            'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN,
+            'Content-Type': 'application/json'
+          }
+        });
+
+        const shopifyData = await shopifyRes.json();
+        
+        console.log(`📦 Shopify status: ${shopifyRes.status}`);
+        
+        if (shopifyData.errors) {
+          console.error('❌ Shopify errors:', shopifyData.errors);
+          throw new Error('Shopify hatası: ' + JSON.stringify(shopifyData.errors));
+        }
+        
+        if (!shopifyData.products || shopifyData.products.length === 0) {
+          console.log('ℹ️ Daha fazla ürün yok');
+          break;
+        }
+
+        allShopifyProducts = allShopifyProducts.concat(shopifyData.products);
+        console.log(`✓ ${shopifyData.products.length} ürün eklendi (toplam: ${allShopifyProducts.length})`);
+        
+        // Pagination: Link header'dan sonraki sayfayı al
+        const linkHeader = shopifyRes.headers.get('Link');
+        nextPageUrl = null;
+        
+        if (linkHeader) {
+          const links = linkHeader.split(',');
+          const nextLink = links.find(link => link.includes('rel="next"'));
+          
+          if (nextLink) {
+            const match = nextLink.match(/<([^>]+)>/);
+            if (match) {
+              nextPageUrl = match[1];
+              console.log('➡️ Sonraki sayfa bulundu');
+            }
+          }
+        }
+        
+        // Rate limiting: Shopify API limit (2 req/sec)
+        if (nextPageUrl) {
+          await new Promise(resolve => setTimeout(resolve, 550)); // 550ms bekle
         }
       }
-    );
+      
+      console.log(`🎉 Toplam ${allShopifyProducts.length} ürün çekildi (${pageCount} sayfa)`);
 
-    const shopifyData = await shopifyRes.json();
-    
-    console.log('📦 Shopify status:', shopifyRes.status);
-    
-    if (shopifyData.errors) {
-      console.error('❌ Shopify errors:', shopifyData.errors);
-      throw new Error('Shopify hatası: ' + JSON.stringify(shopifyData.errors));
-    }
-    
-    if (!shopifyData.products) {
-      console.error('❌ No products:', shopifyData);
-      throw new Error('Shopify yanıt vermedi');
-    }
-
-    // Admin API formatından normalize et
-    const allProducts = shopifyData.products
-      .filter(p => p.status === 'active')
-      .map(p => ({
-        id: p.id.toString(),
-        title: p.title,
-        handle: p.handle,
-        vendor: p.vendor || '', // VENDOR (MARKA) BİLGİSİ
-        productType: p.product_type || '',
-        tags: p.tags ? (typeof p.tags === 'string' ? p.tags.split(', ') : p.tags) : [],
-        priceRange: {
-          minVariantPrice: {
-            amount: p.variants && p.variants[0] ? p.variants[0].price : '0',
-            currencyCode: 'TRY'
+      // Admin API formatından normalize et
+      allProducts = allShopifyProducts
+        .filter(p => p.status === 'active')
+        .map(p => ({
+          id: p.id.toString(),
+          title: p.title,
+          handle: p.handle,
+          vendor: p.vendor || '',
+          productType: p.product_type || '',
+          tags: p.tags ? (typeof p.tags === 'string' ? p.tags.split(', ') : p.tags) : [],
+          priceRange: {
+            minVariantPrice: {
+              amount: p.variants && p.variants[0] ? p.variants[0].price : '0',
+              currencyCode: 'TRY'
+            }
+          },
+          description: p.body_html ? p.body_html.replace(/<[^>]*>/g, '').substring(0, 200) : '',
+          availableForSale: p.variants && p.variants.some(v => 
+            (v.inventory_quantity || 0) > 0 || v.inventory_policy === 'continue'
+          ),
+          featuredImage: {
+            url: p.image?.src || (p.images && p.images[0] ? p.images[0].src : '')
           }
-        },
-        description: p.body_html ? p.body_html.replace(/<[^>]*>/g, '').substring(0, 200) : '',
-        availableForSale: p.variants && p.variants.some(v => 
-          (v.inventory_quantity || 0) > 0 || v.inventory_policy === 'continue'
-        ),
-        featuredImage: {
-          url: p.image?.src || (p.images && p.images[0] ? p.images[0].src : '')
-        }
-      }));
+        }));
 
-    console.log(`📊 Toplam ${allProducts.length} aktif ürün`);
+      // Cache'e kaydet
+      productCache = allProducts;
+      cacheTime = Date.now();
+      
+      console.log(`📊 Toplam ${allProducts.length} aktif ürün`);
 
-    // Mevcut markaları logla (debug için)
-    const uniqueVendors = [...new Set(allProducts.map(p => p.vendor).filter(v => v))];
-    console.log(`🏷️ Mevcut markalar (${uniqueVendors.length}):`, uniqueVendors.slice(0, 10).join(', ') + '...');
+      // Mevcut markaları logla
+      const uniqueVendors = [...new Set(allProducts.map(p => p.vendor).filter(v => v))];
+      console.log(`🏷️ Mevcut markalar (${uniqueVendors.length}):`, uniqueVendors.slice(0, 15).join(', ') + '...');
+    }
 
     // Akıllı filtreleme
     const filteredProducts = smartFilter(allProducts, searchTerms, message);
@@ -157,7 +209,18 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// Cache temizleme endpoint (manuel)
+app.post('/api/clear-cache', (req, res) => {
+  productCache = null;
+  cacheTime = null;
+  console.log('🗑️ Cache temizlendi');
+  res.json({ success: true, message: 'Cache temizlendi' });
+});
+
 app.get('/', (req, res) => {
+  const cacheAge = cacheTime ? Math.floor((Date.now() - cacheTime) / 1000) : null;
+  const cacheStatus = cacheAge ? `${cacheAge}s önce güncellendi` : 'Henüz yüklenmedi';
+  
   res.send(`
     <html>
       <body style="font-family: Arial; padding: 40px; text-align: center;">
@@ -170,8 +233,14 @@ app.get('/', (req, res) => {
           OPENAI_KEY: ${process.env.OPENAI_KEY ? '✅ Set' : '❌ Missing'}<br>
           SHOPIFY_TOKEN: ${process.env.SHOPIFY_TOKEN ? '✅ Set (Admin API)' : '❌ Missing'}
         </p>
+        <p style="color: #666;">
+          <strong>Cache:</strong><br>
+          Ürünler: ${productCache ? productCache.length : 0}<br>
+          Durum: ${cacheStatus}<br>
+          Geçerlilik: ${CACHE_DURATION / 60000} dakika
+        </p>
         <p style="font-size: 12px; color: #999;">
-          v3.0 - Vendor Bazlı Marka Araması + Çeşitlilik + Gelişmiş Kategoriler
+          v4.0 - Pagination + Cache + Vendor Search + Diversity
         </p>
       </body>
     </html>
@@ -182,8 +251,13 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK',
     api: 'Admin API',
-    version: '3.0',
-    features: ['vendor-search', 'diversity', 'smart-filter'],
+    version: '4.0',
+    features: ['pagination', 'cache', 'vendor-search', 'diversity'],
+    cache: {
+      products: productCache ? productCache.length : 0,
+      ageSeconds: cacheTime ? Math.floor((Date.now() - cacheTime) / 1000) : null,
+      validFor: CACHE_DURATION / 1000
+    },
     timestamp: new Date()
   });
 });
@@ -191,7 +265,8 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
-  console.log(`📡 Using Shopify Admin API`);
+  console.log(`📡 Using Shopify Admin API with Pagination`);
+  console.log(`💾 Cache enabled (${CACHE_DURATION / 60000} minutes)`);
   console.log(`🏷️ Vendor-based brand search enabled`);
   console.log(`🎲 Product diversity enabled`);
 });
@@ -204,7 +279,7 @@ function buildSearchTerms(message) {
     animal: null,
     category: null,
     special: [],
-    brandKeywords: [], // Kullanıcının yazdığı potansiyel marka kelimeleri
+    brandKeywords: [],
     freeText: []
   };
 
@@ -246,8 +321,7 @@ function buildSearchTerms(message) {
     terms.freeText.push('taşıma', 'carrier', 'çanta');
   }
 
-  // MARKA TESPİTİ: Kullanıcının yazdığı tüm kelimeleri analiz et
-  // Shopify vendor field'ı ile eşleştirilecek
+  // MARKA TESPİTİ
   const stopWords = [
     'var', 'mi', 'mı', 'için', 'lazim', 'lazım', 'ne', 'nedir', 
     'varmı', 'var mi', 'bir', 'bu', 'şu', 'o', 've', 'ile',
@@ -259,16 +333,15 @@ function buildSearchTerms(message) {
     'kuru', 'yaş', 'yas', 'kuş', 'kus', 'treat', 'food'
   ];
   
-  // Mesajı kelimelere ayır ve potansiyel markaları bul
   const words = msg.split(' ').filter(w => 
     w.length > 2 && 
     !stopWords.includes(w) && 
     !categoryWords.includes(w)
   );
   
-  terms.brandKeywords = words; // Shopify vendor ile karşılaştırılacak
+  terms.brandKeywords = words;
 
-  // Yaş aralığı tespiti (sayısal)
+  // Yaş aralığı
   const ageMatch = msg.match(/(\d+)\s*(yaş|yas|yaşında|yasinda|aylık|aylik)/);
   if (ageMatch) {
     const age = parseInt(ageMatch[1]);
@@ -295,7 +368,7 @@ function buildSearchTerms(message) {
     terms.special.push('tahılsız', 'grain free', 'grainfree');
   }
   
-  // YAŞLI vs YAŞ MAMA - DİKKAT!
+  // YAŞLI vs YAŞ MAMA
   if (msg.includes('yaşlı') || msg.includes('yasli') || msg.includes('senior')) {
     terms.special.push('yaşlı', 'senior', '7+', 'mature', 'elderly');
   } else if (msg.includes('yaş mama') || msg.includes('yas mama') || msg.includes('wet') || msg.includes('pouch')) {
@@ -314,7 +387,7 @@ function buildSearchTerms(message) {
     terms.special.push('yetişkin', 'adult');
   }
 
-  // Sağlık sorunları
+  // Sağlık
   if (msg.includes('böbrek') || msg.includes('bobrek') || msg.includes('renal')) {
     terms.special.push('böbrek', 'renal', 'kidney');
   }
@@ -338,26 +411,21 @@ function smartFilter(products, searchTerms, originalMessage) {
     let score = 0;
     const titleLower = p.title.toLowerCase();
     const descLower = p.description.toLowerCase();
-    const vendorLower = p.vendor.toLowerCase(); // VENDOR (MARKA)
+    const vendorLower = p.vendor.toLowerCase();
     const allTags = p.tags.map(t => t.toLowerCase()).join(' ');
     const productTypeLower = p.productType.toLowerCase();
     const combined = titleLower + ' ' + allTags + ' ' + productTypeLower + ' ' + descLower;
 
-    // 1. VENDOR (MARKA) KONTROLÜ - EN YÜKSEK ÖNCELİK!
+    // 1. VENDOR (MARKA) KONTROLÜ
     if (searchTerms.brandKeywords.length > 0) {
       searchTerms.brandKeywords.forEach(keyword => {
-        // Vendor field'ında tam veya kısmi eşleşme
         if (vendorLower === keyword) {
-          score += 50; // TAM EŞLEŞME - ÇOK YÜKSEK PUAN!
+          score += 50;
         } else if (vendorLower.includes(keyword) || keyword.includes(vendorLower)) {
-          score += 40; // KISMI EŞLEŞME
-        }
-        // Title'da marka adı geçiyor
-        else if (titleLower.includes(keyword)) {
+          score += 40;
+        } else if (titleLower.includes(keyword)) {
           score += 20;
-        }
-        // Tag'de geçiyor
-        else if (allTags.includes(keyword)) {
+        } else if (allTags.includes(keyword)) {
           score += 10;
         }
       });
@@ -387,7 +455,7 @@ function smartFilter(products, searchTerms, originalMessage) {
       if (catMatch) score += 15;
     }
 
-    // 4. Serbest metin arama
+    // 4. Serbest metin
     if (searchTerms.freeText.length > 0) {
       let freeTextMatches = 0;
       searchTerms.freeText.forEach(keyword => {
@@ -401,7 +469,7 @@ function smartFilter(products, searchTerms, originalMessage) {
       }
     }
 
-    // 5. Özel durumlar (kısır, yavru, vs)
+    // 5. Özel durumlar
     if (searchTerms.special.length > 0) {
       let specialMatches = 0;
       searchTerms.special.forEach(keyword => {
@@ -428,7 +496,6 @@ function smartFilter(products, searchTerms, originalMessage) {
     return scoreB - scoreA;
   });
 
-  // ÇEŞİTLİLİK EKLE
   return diversifyProducts(filtered);
 }
 
@@ -440,7 +507,7 @@ function calculateScore(product, searchTerms, originalMessage) {
   const productTypeLower = product.productType.toLowerCase();
   const combined = titleLower + ' ' + allTags + ' ' + productTypeLower;
 
-  // Vendor (marka) - EN ÖNEMLİ
+  // Vendor
   searchTerms.brandKeywords.forEach(keyword => {
     if (vendorLower === keyword) {
       score += 50;
@@ -481,27 +548,23 @@ function calculateScore(product, searchTerms, originalMessage) {
 function diversifyProducts(products) {
   if (products.length <= 12) return products;
 
-  // Fiyata göre sırala
   const sorted = [...products].sort((a, b) => {
     const priceA = parseFloat(a.priceRange.minVariantPrice.amount);
     const priceB = parseFloat(b.priceRange.minVariantPrice.amount);
     return priceA - priceB;
   });
 
-  // 3 gruba böl: Ucuz, Orta, Pahalı
   const third = Math.floor(sorted.length / 3);
   const cheap = sorted.slice(0, third);
   const mid = sorted.slice(third, third * 2);
   const expensive = sorted.slice(third * 2);
 
-  // Her gruptan rastgele seç
   const diversified = [];
   
   diversified.push(...shuffleArray(cheap).slice(0, 4));
   diversified.push(...shuffleArray(mid).slice(0, 4));
   diversified.push(...shuffleArray(expensive).slice(0, 4));
 
-  // Karıştır ve döndür
   return shuffleArray(diversified);
 }
 
@@ -528,20 +591,14 @@ ${i + 1}. **${p.title}**
 
 KURALLAR:
 1. Maksimum 3 ürün öner
-2. Marka bilgilerini vurgula (örn: "Wanpy markasının...", "Royal Canin'in...")
+2. Marka bilgilerini vurgula
 3. ÇEŞİTLİLİK SAĞLA: Farklı fiyat aralıkları ve markalardan seç
-4. Her ürün için kısa açıklama yap (neden uygun?)
+4. Her ürün için kısa açıklama yap
 5. Fiyatları belirt ve karşılaştır
 6. Link ver: [Ürün Adı](URL)
-7. Emoji kullan ama abartma (🐱 🐶 ⭐ 💝)
+7. Emoji kullan (🐱 🐶 ⭐ 💝)
 8. Maksimum 200 kelime
 9. Kullanıcı marka belirttiyse, o markayı ÖNCELİKLE öner
-
-ÖRNEKLER:
-✅ "Wanpy markasının X ürünü ekonomik (150 TL), premium seçenek için Royal Canin Y (450 TL)"
-✅ "Bütçene uygun: Brit A (200 TL), Kaliteli: Hills B (380 TL)"
-❌ "Marka bilgisi verme"
-❌ "Hep aynı fiyat aralığından öner"
 
 ÖNEMLİ: Sadece yukarıdaki ürünlerden öner! Marka ve fiyat çeşitliliğine dikkat et!`;
 }
@@ -549,14 +606,12 @@ KURALLAR:
 function extractProducts(reply, allProducts, sessionId = 'default') {
   const recommended = [];
   
-  // Son önerilenleri al
   const recent = recentRecommendations.get(sessionId) || [];
   
   allProducts.forEach(p => {
     const titleMatch = reply.includes(p.title);
     const handleMatch = reply.includes(p.handle);
     
-    // Son 15 öneride yoksa ekle (çeşitlilik için)
     if ((titleMatch || handleMatch) && 
         recommended.length < 3 && 
         !recent.includes(p.id)) {
@@ -571,7 +626,6 @@ function extractProducts(reply, allProducts, sessionId = 'default') {
     }
   });
   
-  // Eğer yeterli ürün bulunamadıysa (recent filtresinden dolayı)
   if (recommended.length < 3) {
     allProducts.forEach(p => {
       const titleMatch = reply.includes(p.title);
@@ -593,12 +647,10 @@ function extractProducts(reply, allProducts, sessionId = 'default') {
     });
   }
   
-  // Son önerilenleri kaydet (son 15 ürün ID'si)
   const productIds = recommended.map(r => r.handle);
   const updatedRecent = [...recent, ...productIds].slice(-15);
   recentRecommendations.set(sessionId, updatedRecent);
   
-  // Memory leak önleme
   if (recentRecommendations.size > 1000) {
     const entries = Array.from(recentRecommendations.entries());
     recentRecommendations.clear();
