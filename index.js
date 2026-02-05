@@ -547,12 +547,15 @@ function smartFilter(products, searchTerms, originalMessage) {
     return scoreB - scoreA;
   });
 
-  // ÇEŞİTLİLİK KAPALI (TEST İÇİN)
+  // ÇEŞİTLİLİK KAPALI - DOĞRUDAN EN YÜKSEK SKORLU ÜRÜNLER
+  console.log(`🎯 İlk 5 ürün skorları:`);
+  filtered.slice(0, 5).forEach((p, i) => {
+    const score = calculateScore(p, searchTerms, originalMessage);
+    console.log(`  ${i + 1}. ${p.title.substring(0, 50)} - Skor: ${score} - Vendor: ${p.vendor || '(BOŞ)'}`);
+  });
+
   return filtered;
-  
-  // Eğer çeşitlilik istersen, bunu aç:
-  // return diversifyProducts(filtered);
-}}
+}
 
 function calculateScore(product, searchTerms, originalMessage) {
   let score = 0;
