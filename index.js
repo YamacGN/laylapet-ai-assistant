@@ -1,4 +1,3 @@
-require('dotenv').config(); // .env dosyasındaki değişkenleri yükler
 const express = require('express');
 const cors = require('cors');
 const app = express();
@@ -6,14 +5,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-console.log('🚀 Server başlatılıyor...');
+console.log('🚀 Server starting...');
 
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, shopDomain } = req.body;
     
-    console.log('📨 Gelen Mesaj:', message);
-    console.log('🏪 Mağaza:', shopDomain);
+    console.log('📨 Message:', message);
+    console.log('🏪 Shop:', shopDomain);
     
     if (!message || !shopDomain) {
       return res.status(400).json({
@@ -21,72 +20,80 @@ app.post('/api/chat', async (req, res) => {
         products: []
       });
     }
-
-    // Shopify Sorgusu Oluşturma
-    const query = buildQuery(message);
-    console.log('🔍 Shopify Sorgusu:', query);
-
-    // 1. Shopify'dan Ürünleri Çek (Admin API Ayarlarıyla)
-    const shopifyRes = await fetch(`https://${shopDomain}/admin/api/2024-01/graphql.json`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        // ÖNEMLİ: shpat_ tokenı için doğru header budur:
-        'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN 
-      },
-      body: JSON.stringify({
-        query: `
-          {
-            products(first: 15, query: "${escapeQuery(query)}") {
-              edges {
-                node {
-                  id
-                  title
-                  handle
-                  productType
-                  tags
-                  priceRange {
-                    minVariantPrice {
-                      amount
-                      currencyCode
-                    }
-                  }
-                  description
-                  availableForSale
-                  featuredImage {
-                    url
-                  }
-                }
-              }
-            }
-          }
-        `
-      })
-    });
+    
+    // Query oluştur
+    const searchTerms = buildSearchTerms(message);
+    console.log('🔍 Search terms:', searchTerms);
+    
+    // 1. Shopify Admin API - Ürünleri çek (REST API)
+    const shopifyRes = await fetch(
+      `https://${shopDomain}/admin/api/2024-01/products.json?limit=250&status=active`,
+      {
+        method: 'GET',
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
 
     const shopifyData = await shopifyRes.json();
-    console.log('📦 Shopify Yanıt Durumu:', shopifyRes.status);
-
+    
+    console.log('📦 Shopify status:', shopifyRes.status);
+    
     if (shopifyData.errors) {
-      console.error('❌ Shopify Hatası:', shopifyData.errors);
-      throw new Error('Shopify API hatası oluştu.');
+      console.error('❌ Shopify errors:', shopifyData.errors);
+      throw new Error('Shopify hatası: ' + JSON.stringify(shopifyData.errors));
+    }
+    
+    if (!shopifyData.products) {
+      console.error('❌ No products:', shopifyData);
+      throw new Error('Shopify yanıt vermedi');
     }
 
-    const products = (shopifyData.data?.products?.edges || [])
-      .map(e => e.node)
-      .filter(p => p.availableForSale);
+    // Admin API formatından GraphQL formatına çevir
+    const allProducts = shopifyData.products
+      .filter(p => p.status === 'active')
+      .map(p => ({
+        id: p.id.toString(),
+        title: p.title,
+        handle: p.handle,
+        productType: p.product_type || '',
+        tags: p.tags ? (typeof p.tags === 'string' ? p.tags.split(', ') : p.tags) : [],
+        priceRange: {
+          minVariantPrice: {
+            amount: p.variants && p.variants[0] ? p.variants[0].price : '0',
+            currencyCode: 'TRY'
+          }
+        },
+        description: p.body_html ? p.body_html.replace(/<[^>]*>/g, '').substring(0, 300) : '',
+        availableForSale: p.variants && p.variants.some(v => 
+          (v.inventory_quantity || 0) > 0 || v.inventory_policy === 'continue'
+        ),
+        featuredImage: {
+          url: p.image?.src || (p.images && p.images[0] ? p.images[0].src : '')
+        }
+      }));
 
-    console.log(`✅ ${products.length} adet uygun ürün bulundu.`);
+    console.log(`📊 Toplam ${allProducts.length} aktif ürün`);
 
-    if (products.length === 0) {
+    // Kullanıcı sorgusuna göre filtrele
+    const filteredProducts = filterProducts(allProducts, searchTerms);
+
+    console.log(`✅ ${filteredProducts.length} ürün filtrelendi`);
+
+    if (filteredProducts.length === 0) {
       return res.json({
-        reply: 'Aradığın kriterlere uygun bir ürün bulamadım 😔 Başka bir şey sormak ister misin?',
+        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Köpek ödülü"\n• "Yavru mama"',
         products: []
       });
     }
 
-    // 2. OpenAI'ya Gönder
-    const systemPrompt = generateSystemPrompt(products, shopDomain);
+    // En fazla 15 ürünü AI'ya gönder
+    const productsForAI = filteredProducts.slice(0, 15);
+
+    // 2. OpenAI'ya gönder
+    const systemPrompt = generateSystemPrompt(productsForAI, shopDomain);
     
     const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -100,20 +107,29 @@ app.post('/api/chat', async (req, res) => {
           { role: 'system', content: systemPrompt },
           { role: 'user', content: message }
         ],
-        temperature: 0.7
+        temperature: 0.7,
+        max_tokens: 600
       })
     });
 
     const aiData = await aiRes.json();
     
+    console.log('🤖 OpenAI status:', aiRes.status);
+    
     if (aiData.error) {
-      throw new Error('OpenAI Hatası: ' + aiData.error.message);
+      console.error('❌ OpenAI error:', aiData.error);
+      throw new Error('OpenAI hatası: ' + aiData.error.message);
+    }
+    
+    if (!aiData.choices || !aiData.choices[0]) {
+      console.error('❌ No choices:', aiData);
+      throw new Error('OpenAI yanıt vermedi');
     }
 
     const reply = aiData.choices[0].message.content;
-    const recommended = extractProducts(reply, products);
+    const recommended = extractProducts(reply, productsForAI);
 
-    console.log('✅ İşlem başarıyla tamamlandı.');
+    console.log('✅ Başarılı!');
 
     res.json({
       reply,
@@ -121,70 +137,189 @@ app.post('/api/chat', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Hata Detayı:', error);
+    console.error('❌ Error:', error);
     res.status(500).json({
       error: error.message,
-      reply: 'Üzgünüm, bir bağlantı hatası oluştu. Lütfen tekrar dene.'
+      reply: 'Bir hata oluştu: ' + error.message
     });
   }
 });
 
-// Sunucu Durumu Kontrol Sayfası
 app.get('/', (req, res) => {
   res.send(`
-    <div style="font-family: sans-serif; text-align: center; padding: 50px;">
-      <h1>🐾 Laylapet AI API</h1>
-      <p>Durum: ${process.env.SHOPIFY_TOKEN ? '✅ Bağlı' : '❌ Token Eksik'}</p>
-      <p>Endpoint: <code>POST /api/chat</code></p>
-    </div>
+    <html>
+      <body style="font-family: Arial; padding: 40px; text-align: center;">
+        <h1>🐾 Laylapet AI Assistant</h1>
+        <p><strong>Server çalışıyor!</strong> ✅</p>
+        <p>API: <code>POST /api/chat</code></p>
+        <hr style="margin: 30px 0;">
+        <p style="color: #666;">
+          <strong>Environment:</strong><br>
+          OPENAI_KEY: ${process.env.OPENAI_KEY ? '✅ Set' : '❌ Missing'}<br>
+          SHOPIFY_TOKEN: ${process.env.SHOPIFY_TOKEN ? '✅ Set (Admin API)' : '❌ Missing'}
+        </p>
+        <p style="font-size: 12px; color: #999;">
+          Using Shopify Admin API (REST)
+        </p>
+      </body>
+    </html>
   `);
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK',
+    api: 'Admin API',
+    timestamp: new Date()
+  });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Sunucu port ${PORT} üzerinde çalışıyor.`);
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`📡 Using Shopify Admin API`);
 });
 
 // ========== YARDIMCI FONKSİYONLAR ==========
 
-function escapeQuery(str) {
-  return str.replace(/"/g, '\\"');
+function buildSearchTerms(message) {
+  const msg = message.toLowerCase();
+  const terms = {
+    animal: null,
+    category: null,
+    tags: []
+  };
+
+  // Hayvan türü
+  if (msg.includes('kedi')) {
+    terms.animal = 'kedi';
+  } else if (msg.includes('köpek') || msg.includes('kopek')) {
+    terms.animal = 'köpek';
+  }
+
+  // Kategori
+  if (msg.includes('mama')) {
+    terms.category = 'mama';
+    terms.tags.push('mama');
+  } else if (msg.includes('ödül') || msg.includes('odul') || msg.includes('treat')) {
+    terms.category = 'ödül';
+    terms.tags.push('ödül', 'treat');
+  } else if (msg.includes('oyuncak')) {
+    terms.category = 'oyuncak';
+    terms.tags.push('oyuncak');
+  }
+
+  // Özel özellikler
+  if (msg.includes('yavru') || msg.includes('puppy') || msg.includes('kitten')) {
+    terms.tags.push('yavru', 'puppy', 'kitten');
+  }
+  if (msg.includes('tahılsız') || msg.includes('tahilsiz') || msg.includes('grain free')) {
+    terms.tags.push('tahılsız', 'grain free');
+  }
+  if (msg.includes('yaş') || msg.includes('wet')) {
+    terms.tags.push('yaş', 'wet');
+  }
+  if (msg.includes('kuru') || msg.includes('dry')) {
+    terms.tags.push('kuru', 'dry');
+  }
+
+  return terms;
 }
 
-function buildQuery(message) {
-  const msg = message.toLowerCase();
-  const queries = [];
+function filterProducts(products, searchTerms) {
+  return products.filter(p => {
+    let score = 0;
 
-  if (msg.includes('kedi')) queries.push('product_type:Kedi');
-  if (msg.includes('köpek') || msg.includes('kopek')) queries.push('product_type:Köpek');
-  if (msg.includes('mama')) queries.push('tag:mama');
-  if (msg.includes('ödül') || msg.includes('odul')) queries.push('tag:ödül');
-  
-  return queries.length > 0 ? queries.join(' AND ') : 'status:active';
+    // Hayvan türü kontrolü (product_type veya tags)
+    if (searchTerms.animal) {
+      const typeMatch = p.productType.toLowerCase().includes(searchTerms.animal);
+      const tagMatch = p.tags.some(tag => tag.toLowerCase().includes(searchTerms.animal));
+      const titleMatch = p.title.toLowerCase().includes(searchTerms.animal);
+      
+      if (typeMatch || tagMatch || titleMatch) {
+        score += 10;
+      } else {
+        return false; // Hayvan türü eşleşmezse direkt eleme
+      }
+    }
+
+    // Kategori kontrolü
+    if (searchTerms.category) {
+      const catMatch = p.tags.some(tag => tag.toLowerCase().includes(searchTerms.category));
+      const titleMatch = p.title.toLowerCase().includes(searchTerms.category);
+      const typeMatch = p.productType.toLowerCase().includes(searchTerms.category);
+      
+      if (catMatch || titleMatch || typeMatch) {
+        score += 5;
+      }
+    }
+
+    // Tag kontrolü
+    searchTerms.tags.forEach(searchTag => {
+      const tagMatch = p.tags.some(tag => tag.toLowerCase().includes(searchTag.toLowerCase()));
+      const titleMatch = p.title.toLowerCase().includes(searchTag.toLowerCase());
+      
+      if (tagMatch || titleMatch) {
+        score += 3;
+      }
+    });
+
+    // Stokta olmalı
+    if (p.availableForSale) {
+      score += 1;
+    }
+
+    return score > 0;
+  }).sort((a, b) => {
+    // Fiyat karşılaştırması için score hesapla
+    return parseFloat(a.priceRange.minVariantPrice.amount) - parseFloat(b.priceRange.minVariantPrice.amount);
+  });
 }
 
 function generateSystemPrompt(products, domain) {
-  return `Sen Laylapet mağazasının uzman kedi/köpek danışmanısın. 
-  Müşteriye samimi bir dille yardımcı ol. 
-  Sadece sana verdiğim ürün listesini kullan. 
-  Ürün linklerini mutlaka [Ürün Adı](https://${domain}/products/handle) formatında ver.
-  Fiyatları TL cinsinden belirt.
-  
-  ÜRÜN LİSTESİ:
-  ${products.map(p => `- ${p.title} (Fiyat: ${p.priceRange.minVariantPrice.amount}, Link: ${p.handle})`).join('\n')}`;
+  return `Sen Laylapet'in AI pet shop danışmanısın! 🐾
+
+Türkçe konuş, samimi ve yardımsever ol.
+
+MEVCUT ÜRÜNLER (${products.length} adet):
+${products.map((p, i) => `
+${i + 1}. ${p.title}
+   💰 Fiyat: ${parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2)} ${p.priceRange.minVariantPrice.currencyCode}
+   📦 Kategori: ${p.productType}
+   🏷️ Etiketler: ${p.tags.slice(0, 5).join(', ')}
+   🔗 Link: https://${domain}/products/${p.handle}
+`).join('\n')}
+
+KURALLAR:
+1. ✅ SADECE yukarıdaki ürünlerden öner
+2. ✅ Maksimum 3 ürün öner
+3. ✅ Her ürün için fiyat belirt
+4. ✅ Link formatı: [Ürün Adı](https://${domain}/products/handle)
+5. ✅ Emoji kullan (🐱 🐶 🐾 💝 ⭐)
+6. ✅ Kısa ve öz yaz (maksimum 250 kelime)
+7. ✅ Ürün özelliklerini vurgula (tahılsız, yavru, vs)
+
+Müşteriye en uygun ürünleri öner! 🚀`;
 }
 
 function extractProducts(reply, allProducts) {
   const recommended = [];
+  
   allProducts.forEach(p => {
-    if (reply.includes(p.title) && recommended.length < 3) {
+    // Başlık veya handle eşleşmesi
+    const titleMatch = reply.includes(p.title);
+    const handleMatch = reply.includes(p.handle);
+    
+    if ((titleMatch || handleMatch) && recommended.length < 3) {
       recommended.push({
         title: p.title,
         handle: p.handle,
-        price: p.priceRange.minVariantPrice.amount,
-        image: p.featuredImage?.url
+        price: parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2),
+        currency: p.priceRange.minVariantPrice.currencyCode,
+        image: p.featuredImage?.url || ''
       });
     }
   });
+  
   return recommended;
 }
