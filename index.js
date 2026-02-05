@@ -61,6 +61,7 @@ app.post('/api/chat', async (req, res) => {
         id: p.id.toString(),
         title: p.title,
         handle: p.handle,
+        vendor: p.vendor || '', // VENDOR (MARKA) BİLGİSİ
         productType: p.product_type || '',
         tags: p.tags ? (typeof p.tags === 'string' ? p.tags.split(', ') : p.tags) : [],
         priceRange: {
@@ -80,6 +81,10 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`📊 Toplam ${allProducts.length} aktif ürün`);
 
+    // Mevcut markaları logla (debug için)
+    const uniqueVendors = [...new Set(allProducts.map(p => p.vendor).filter(v => v))];
+    console.log(`🏷️ Mevcut markalar (${uniqueVendors.length}):`, uniqueVendors.slice(0, 10).join(', ') + '...');
+
     // Akıllı filtreleme
     const filteredProducts = smartFilter(allProducts, searchTerms, message);
 
@@ -87,7 +92,7 @@ app.post('/api/chat', async (req, res) => {
 
     if (filteredProducts.length === 0) {
       return res.json({
-        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Köpek ödülü"\n• "Kısır kedi için mama"\n• "Royal Canin mama"\n• "Köpek şampuanı"',
+        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Wanpy kuru mama"\n• "Royal Canin kısır kedi maması"\n• "Köpek şampuanı"',
         products: []
       });
     }
@@ -110,7 +115,7 @@ app.post('/api/chat', async (req, res) => {
           { role: 'system', content: systemPrompt },
           { role: 'user', content: message }
         ],
-        temperature: 0.8, // Daha fazla çeşitlilik için artırıldı
+        temperature: 0.8,
         max_tokens: 500
       })
     });
@@ -131,7 +136,7 @@ app.post('/api/chat', async (req, res) => {
 
     const reply = aiData.choices[0].message.content;
     
-    // Session ID (gerçek uygulamada user ID kullanın)
+    // Session ID
     const sessionId = req.headers['x-session-id'] || shopDomain;
     
     const recommended = extractProducts(reply, productsForAI, sessionId);
@@ -166,7 +171,7 @@ app.get('/', (req, res) => {
           SHOPIFY_TOKEN: ${process.env.SHOPIFY_TOKEN ? '✅ Set (Admin API)' : '❌ Missing'}
         </p>
         <p style="font-size: 12px; color: #999;">
-          v2.0 - Marka Araması + Çeşitlilik + Gelişmiş Kategoriler
+          v3.0 - Vendor Bazlı Marka Araması + Çeşitlilik + Gelişmiş Kategoriler
         </p>
       </body>
     </html>
@@ -177,7 +182,8 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK',
     api: 'Admin API',
-    version: '2.0',
+    version: '3.0',
+    features: ['vendor-search', 'diversity', 'smart-filter'],
     timestamp: new Date()
   });
 });
@@ -186,7 +192,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`📡 Using Shopify Admin API`);
-  console.log(`🎲 Diversity enabled`);
+  console.log(`🏷️ Vendor-based brand search enabled`);
+  console.log(`🎲 Product diversity enabled`);
 });
 
 // ========== YARDIMCI FONKSİYONLAR ==========
@@ -197,7 +204,7 @@ function buildSearchTerms(message) {
     animal: null,
     category: null,
     special: [],
-    brands: [],
+    brandKeywords: [], // Kullanıcının yazdığı potansiyel marka kelimeleri
     freeText: []
   };
 
@@ -212,7 +219,7 @@ function buildSearchTerms(message) {
     terms.animal = 'balık';
   }
 
-  // Kategoriler (GENİŞLETİLDİ)
+  // Kategoriler
   if (msg.includes('mama')) {
     terms.category = 'mama';
   } else if (msg.includes('ödül') || msg.includes('odul') || msg.includes('treat')) {
@@ -223,7 +230,7 @@ function buildSearchTerms(message) {
     terms.category = 'bakım';
     if (msg.includes('krem')) terms.freeText.push('krem', 'cream');
     if (msg.includes('şampuan') || msg.includes('sampuan')) terms.freeText.push('şampuan', 'shampoo');
-  } else if (msg.includes('tasma') || msg.includes('gezdirme') || msg.includes('tasma')) {
+  } else if (msg.includes('tasma') || msg.includes('gezdirme')) {
     terms.category = 'aksesuar';
     terms.freeText.push('tasma', 'gezdirme', 'leash', 'collar');
   } else if (msg.includes('kum') || msg.includes('tuvalet')) {
@@ -239,21 +246,27 @@ function buildSearchTerms(message) {
     terms.freeText.push('taşıma', 'carrier', 'çanta');
   }
 
-  // Markalar (GENİŞLETİLDİ)
-  const brands = [
-    'royal canin', 'brit', 'hills', 'purina', 'pedigree', 
-    'whiskas', 'friskies', 'proplan', 'pro plan', 'felix', 'sheba',
-    'acana', 'orijen', 'taste of the wild', 'carnilove',
-    'n&d', 'farmina', 'monge', 'josera', 'bosch',
-    'applaws', 'wellness', 'blue buffalo', 'canagan',
-    'lily kitchen', 'natures menu', 'almo nature'
+  // MARKA TESPİTİ: Kullanıcının yazdığı tüm kelimeleri analiz et
+  // Shopify vendor field'ı ile eşleştirilecek
+  const stopWords = [
+    'var', 'mi', 'mı', 'için', 'lazim', 'lazım', 'ne', 'nedir', 
+    'varmı', 'var mi', 'bir', 'bu', 'şu', 'o', 've', 'ile',
+    'çok', 'az', 'iyi', 'güzel', 'ucuz', 'pahalı'
   ];
   
-  brands.forEach(brand => {
-    if (msg.includes(brand)) {
-      terms.brands.push(brand);
-    }
-  });
+  const categoryWords = [
+    'kedi', 'köpek', 'kopek', 'mama', 'ödül', 'odul', 'oyuncak', 
+    'kuru', 'yaş', 'yas', 'kuş', 'kus', 'treat', 'food'
+  ];
+  
+  // Mesajı kelimelere ayır ve potansiyel markaları bul
+  const words = msg.split(' ').filter(w => 
+    w.length > 2 && 
+    !stopWords.includes(w) && 
+    !categoryWords.includes(w)
+  );
+  
+  terms.brandKeywords = words; // Shopify vendor ile karşılaştırılacak
 
   // Yaş aralığı tespiti (sayısal)
   const ageMatch = msg.match(/(\d+)\s*(yaş|yas|yaşında|yasinda|aylık|aylik)/);
@@ -283,7 +296,7 @@ function buildSearchTerms(message) {
   }
   
   // YAŞLI vs YAŞ MAMA - DİKKAT!
-  if (msg.includes('yaşlı') || msg.includes('yasli') || msg.includes('senior') || msg.includes('yaşli')) {
+  if (msg.includes('yaşlı') || msg.includes('yasli') || msg.includes('senior')) {
     terms.special.push('yaşlı', 'senior', '7+', 'mature', 'elderly');
   } else if (msg.includes('yaş mama') || msg.includes('yas mama') || msg.includes('wet') || msg.includes('pouch')) {
     terms.special.push('yaş', 'wet', 'pouch', 'konserve');
@@ -325,22 +338,29 @@ function smartFilter(products, searchTerms, originalMessage) {
     let score = 0;
     const titleLower = p.title.toLowerCase();
     const descLower = p.description.toLowerCase();
+    const vendorLower = p.vendor.toLowerCase(); // VENDOR (MARKA)
     const allTags = p.tags.map(t => t.toLowerCase()).join(' ');
     const productTypeLower = p.productType.toLowerCase();
     const combined = titleLower + ' ' + allTags + ' ' + productTypeLower + ' ' + descLower;
 
-    // 1. MARKA kontrolü (YÜKSEK ÖNCELİK)
-    if (searchTerms.brands.length > 0) {
-      let brandMatch = false;
-      searchTerms.brands.forEach(brand => {
-        if (combined.includes(brand)) {
-          score += 30;
-          brandMatch = true;
+    // 1. VENDOR (MARKA) KONTROLÜ - EN YÜKSEK ÖNCELİK!
+    if (searchTerms.brandKeywords.length > 0) {
+      searchTerms.brandKeywords.forEach(keyword => {
+        // Vendor field'ında tam veya kısmi eşleşme
+        if (vendorLower === keyword) {
+          score += 50; // TAM EŞLEŞME - ÇOK YÜKSEK PUAN!
+        } else if (vendorLower.includes(keyword) || keyword.includes(vendorLower)) {
+          score += 40; // KISMI EŞLEŞME
+        }
+        // Title'da marka adı geçiyor
+        else if (titleLower.includes(keyword)) {
+          score += 20;
+        }
+        // Tag'de geçiyor
+        else if (allTags.includes(keyword)) {
+          score += 10;
         }
       });
-      if (!brandMatch) {
-        score -= 10;
-      }
     }
 
     // 2. Hayvan türü
@@ -381,7 +401,7 @@ function smartFilter(products, searchTerms, originalMessage) {
       }
     }
 
-    // 5. Özel durumlar
+    // 5. Özel durumlar (kısır, yavru, vs)
     if (searchTerms.special.length > 0) {
       let specialMatches = 0;
       searchTerms.special.forEach(keyword => {
@@ -395,24 +415,7 @@ function smartFilter(products, searchTerms, originalMessage) {
       }
     }
 
-    // 6. Genel arama (spesifik kriter yoksa)
-    const hasSpecificCriteria = 
-      searchTerms.animal || 
-      searchTerms.category || 
-      searchTerms.special.length > 0 || 
-      searchTerms.brands.length > 0 ||
-      searchTerms.freeText.length > 0;
-
-    if (!hasSpecificCriteria) {
-      const words = msg.split(' ').filter(w => w.length > 2);
-      words.forEach(word => {
-        if (combined.includes(word)) {
-          score += 5;
-        }
-      });
-    }
-
-    // 7. Stokta olmalı
+    // 6. Stokta olmalı
     if (p.availableForSale) {
       score += 3;
     }
@@ -432,14 +435,19 @@ function smartFilter(products, searchTerms, originalMessage) {
 function calculateScore(product, searchTerms, originalMessage) {
   let score = 0;
   const titleLower = product.title.toLowerCase();
+  const vendorLower = product.vendor.toLowerCase();
   const allTags = product.tags.map(t => t.toLowerCase()).join(' ');
   const productTypeLower = product.productType.toLowerCase();
   const combined = titleLower + ' ' + allTags + ' ' + productTypeLower;
 
-  // Marka
-  searchTerms.brands.forEach(brand => {
-    if (combined.includes(brand)) {
-      score += 30;
+  // Vendor (marka) - EN ÖNEMLİ
+  searchTerms.brandKeywords.forEach(keyword => {
+    if (vendorLower === keyword) {
+      score += 50;
+    } else if (vendorLower.includes(keyword) || keyword.includes(vendorLower)) {
+      score += 40;
+    } else if (titleLower.includes(keyword)) {
+      score += 20;
     }
   });
 
@@ -464,14 +472,6 @@ function calculateScore(product, searchTerms, originalMessage) {
   searchTerms.special.forEach(keyword => {
     if (combined.includes(keyword)) {
       score += 10;
-    }
-  });
-
-  // Genel kelime eşleşmesi
-  const words = originalMessage.toLowerCase().split(' ').filter(w => w.length > 2);
-  words.forEach(word => {
-    if (combined.includes(word)) {
-      score += 3;
     }
   });
   
@@ -517,32 +517,33 @@ function shuffleArray(array) {
 function generateSystemPrompt(products, domain) {
   return `Sen Laylapet'in AI danışmanısın! 🐾 Türkçe konuş, profesyonel ama samimi ol.
 
-MEVCUT ÜRÜNLER (${products.length} adet - ÇEŞİTLİ FİYAT ARALIKLARINDAN):
+MEVCUT ÜRÜNLER (${products.length} adet - ÇEŞİTLİ FİYAT VE MARKA SEÇENEKLERDEN):
 ${products.map((p, i) => `
 ${i + 1}. **${p.title}**
+   🏷️ Marka: ${p.vendor || 'Belirtilmemiş'}
    💰 ${parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2)} TL
    📦 ${p.productType}
-   🏷️ ${p.tags.slice(0, 3).join(', ')}
    🔗 https://${domain}/products/${p.handle}
 `).join('\n')}
 
 KURALLAR:
 1. Maksimum 3 ürün öner
-2. ÇEŞİTLİLİK SAĞLA: Farklı fiyat aralıklarından seç (ekonomik, orta, premium)
-3. Her ürün için kısa açıklama yap (neden uygun?)
-4. Fiyatları belirt ve karşılaştır
-5. Link ver: [Ürün Adı](URL)
-6. Emoji kullan ama abartma (🐱 🐶 ⭐ 💝)
-7. Maksimum 200 kelime
-8. FARKLI SEÇENEKLER öner - listenin farklı yerlerinden seç!
+2. Marka bilgilerini vurgula (örn: "Wanpy markasının...", "Royal Canin'in...")
+3. ÇEŞİTLİLİK SAĞLA: Farklı fiyat aralıkları ve markalardan seç
+4. Her ürün için kısa açıklama yap (neden uygun?)
+5. Fiyatları belirt ve karşılaştır
+6. Link ver: [Ürün Adı](URL)
+7. Emoji kullan ama abartma (🐱 🐶 ⭐ 💝)
+8. Maksimum 200 kelime
+9. Kullanıcı marka belirttiyse, o markayı ÖNCELİKLE öner
 
 ÖRNEKLER:
-✅ "Bütçene uygun: X (150 TL), Kaliteli seçenek: Y (350 TL), Premium: Z (500 TL)"
-✅ "Ekonomik ama kaliteli: A, Orta segment: B, En iyi kalite: C"
-❌ "Sadece listedeki ilk 3 ürünü öner"
-❌ "Hep en pahalıları öner"
+✅ "Wanpy markasının X ürünü ekonomik (150 TL), premium seçenek için Royal Canin Y (450 TL)"
+✅ "Bütçene uygun: Brit A (200 TL), Kaliteli: Hills B (380 TL)"
+❌ "Marka bilgisi verme"
+❌ "Hep aynı fiyat aralığından öner"
 
-ÖNEMLİ: Sadece yukarıdaki ürünlerden öner! Farklı fiyat noktalarından çeşitlilik sağla!`;
+ÖNEMLİ: Sadece yukarıdaki ürünlerden öner! Marka ve fiyat çeşitliliğine dikkat et!`;
 }
 
 function extractProducts(reply, allProducts, sessionId = 'default') {
@@ -555,7 +556,7 @@ function extractProducts(reply, allProducts, sessionId = 'default') {
     const titleMatch = reply.includes(p.title);
     const handleMatch = reply.includes(p.handle);
     
-    // Son 5 öneride yoksa ekle (çeşitlilik için)
+    // Son 15 öneride yoksa ekle (çeşitlilik için)
     if ((titleMatch || handleMatch) && 
         recommended.length < 3 && 
         !recent.includes(p.id)) {
@@ -564,7 +565,8 @@ function extractProducts(reply, allProducts, sessionId = 'default') {
         handle: p.handle,
         price: parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2),
         currency: p.priceRange.minVariantPrice.currencyCode,
-        image: p.featuredImage?.url || ''
+        image: p.featuredImage?.url || '',
+        vendor: p.vendor || ''
       });
     }
   });
@@ -583,7 +585,8 @@ function extractProducts(reply, allProducts, sessionId = 'default') {
             handle: p.handle,
             price: parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2),
             currency: p.priceRange.minVariantPrice.currencyCode,
-            image: p.featuredImage?.url || ''
+            image: p.featuredImage?.url || '',
+            vendor: p.vendor || ''
           });
         }
       }
@@ -595,7 +598,7 @@ function extractProducts(reply, allProducts, sessionId = 'default') {
   const updatedRecent = [...recent, ...productIds].slice(-15);
   recentRecommendations.set(sessionId, updatedRecent);
   
-  // 1 saatte bir temizle (memory leak önleme)
+  // Memory leak önleme
   if (recentRecommendations.size > 1000) {
     const entries = Array.from(recentRecommendations.entries());
     recentRecommendations.clear();
