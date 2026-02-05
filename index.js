@@ -104,27 +104,44 @@ app.post('/api/chat', async (req, res) => {
       // Admin API formatından normalize et
       allProducts = allShopifyProducts
         .filter(p => p.status === 'active')
-        .map(p => ({
-          id: p.id.toString(),
-          title: p.title,
-          handle: p.handle,
-          vendor: p.vendor || '',
-          productType: p.product_type || '',
-          tags: p.tags ? (typeof p.tags === 'string' ? p.tags.split(', ') : p.tags) : [],
-          priceRange: {
-            minVariantPrice: {
-              amount: p.variants && p.variants[0] ? p.variants[0].price : '0',
-              currencyCode: 'TRY'
+        .map(p => {
+          // HTML tag'lerini temizle ve TAM AÇIKLAMAYI al
+          const fullDesc = p.body_html 
+            ? p.body_html
+                .replace(/<[^>]*>/g, '') // HTML tag'leri sil
+                .replace(/&nbsp;/g, ' ') // &nbsp; → boşluk
+                .replace(/&amp;/g, '&')  // &amp; → &
+                .replace(/&quot;/g, '"') // &quot; → "
+                .replace(/&#39;/g, "'")  // &#39; → '
+                .replace(/&lt;/g, '<')   // &lt; → <
+                .replace(/&gt;/g, '>')   // &gt; → >
+                .replace(/\s+/g, ' ')    // Çoklu boşlukları tek yap
+                .trim()
+            : '';
+          
+          return {
+            id: p.id.toString(),
+            title: p.title,
+            handle: p.handle,
+            vendor: p.vendor || '',
+            productType: p.product_type || '',
+            tags: p.tags ? (typeof p.tags === 'string' ? p.tags.split(', ') : p.tags) : [],
+            priceRange: {
+              minVariantPrice: {
+                amount: p.variants && p.variants[0] ? p.variants[0].price : '0',
+                currencyCode: 'TRY'
+              }
+            },
+            description: fullDesc, // TAM AÇIKLAMA (filtreleme için)
+            descriptionShort: fullDesc.substring(0, 150), // Kısa özet (AI için)
+            availableForSale: p.variants && p.variants.some(v => 
+              (v.inventory_quantity || 0) > 0 || v.inventory_policy === 'continue'
+            ),
+            featuredImage: {
+              url: p.image?.src || (p.images && p.images[0] ? p.images[0].src : '')
             }
-          },
-          description: p.body_html ? p.body_html.replace(/<[^>]*>/g, '').substring(0, 200) : '',
-          availableForSale: p.variants && p.variants.some(v => 
-            (v.inventory_quantity || 0) > 0 || v.inventory_policy === 'continue'
-          ),
-          featuredImage: {
-            url: p.image?.src || (p.images && p.images[0] ? p.images[0].src : '')
-          }
-        }));
+          };
+        });
 
       // Cache'e kaydet
       productCache = allProducts;
@@ -150,7 +167,7 @@ app.post('/api/chat', async (req, res) => {
 
     if (filteredProducts.length === 0) {
       return res.json({
-        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Wanpy kuru mama"\n• "Royal Canin kısır kedi maması"\n• "Köpek şampuanı"',
+        reply: 'Bu kriterlere uygun ürün bulamadım 😔\n\nBaşka bir şey deneyebilir misin?\n\n💡 Öneriler:\n• "Kedi maması"\n• "Tavuksuz kedi maması"\n• "Tahılsız köpek maması"\n• "Az balık içerikli mama"',
         products: []
       });
     }
@@ -159,7 +176,7 @@ app.post('/api/chat', async (req, res) => {
     const productsForAI = filteredProducts.slice(0, 12);
 
     // 2. OpenAI'ya gönder
-    const systemPrompt = generateSystemPrompt(productsForAI, shopDomain);
+    const systemPrompt = generateSystemPrompt(productsForAI, shopDomain, searchTerms);
     
     const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -258,7 +275,7 @@ app.get('/api/vendors', (req, res) => {
 
 app.get('/', (req, res) => {
   const cacheAge = cacheTime ? Math.floor((Date.now() - cacheTime) / 1000) : null;
-  const cacheStatus = cacheAge ? `${cacheAge}s önce güncellendi` : 'Henüz yüklenmedi';
+  const cacheStatus = cacheAge ? `${cacheAge}s önce güncellendi` : 'Hen��z yüklenmedi';
   
   res.send(`
     <html>
@@ -279,7 +296,7 @@ app.get('/', (req, res) => {
           Geçerlilik: ${CACHE_DURATION / 60000} dakika
         </p>
         <p style="font-size: 12px; color: #999;">
-          v4.1 - Title-Based Brand Search + Pagination + Cache
+          v5.0 - Dynamic Negative Filter + Full Description + Title Search
         </p>
         <p>
           <a href="/api/vendors" style="color: #4CAF50;">Vendor Listesi</a>
@@ -293,8 +310,15 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK',
     api: 'Admin API',
-    version: '4.1',
-    features: ['pagination', 'cache', 'title-brand-search', 'vendor-search', 'diversity'],
+    version: '5.0',
+    features: [
+      'pagination', 
+      'cache', 
+      'dynamic-negative-filter',
+      'full-description',
+      'title-brand-search', 
+      'vendor-search'
+    ],
     cache: {
       products: productCache ? productCache.length : 0,
       ageSeconds: cacheTime ? Math.floor((Date.now() - cacheTime) / 1000) : null,
@@ -309,8 +333,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`📡 Using Shopify Admin API with Pagination`);
   console.log(`💾 Cache enabled (${CACHE_DURATION / 60000} minutes)`);
+  console.log(`🚫 Dynamic negative filtering enabled`);
+  console.log(`📝 Full product descriptions enabled`);
   console.log(`🏷️ Title + Vendor based brand search enabled`);
-  console.log(`🎲 Product diversity enabled`);
 });
 
 // ========== YARDIMCI FONKSİYONLAR ==========
@@ -322,7 +347,8 @@ function buildSearchTerms(message) {
     category: null,
     special: [],
     brandKeywords: [],
-    freeText: []
+    freeText: [],
+    exclude: [] // Hariç tutulacak HERHANGI BİR içerik
   };
 
   // Hayvan türü
@@ -363,25 +389,91 @@ function buildSearchTerms(message) {
     terms.freeText.push('taşıma', 'carrier', 'çanta');
   }
 
+  // ========== DİNAMİK NEGATİF ALGILAMA ==========
+  
+  // NEGATİF KELİMELER
+  const negativeWords = ['yok', 'olmadan', 'içermesin', 'icermesin', 'hariç', 'haric', 'istemiyorum', 'istemem', 'değil', 'degil'];
+  
+  // 1. "-sız/-siz/-suz/-süz" ekleri: "tavuksuz", "tahılsız"
+  const suffixPattern = /([\wğüşıöçĞÜŞİÖÇ]{3,})(sız|siz|suz|süz)/gi;
+  let match;
+  
+  while ((match = suffixPattern.exec(msg)) !== null) {
+    const ingredient = match[1].toLowerCase();
+    if (ingredient.length > 2) {
+      terms.exclude.push(ingredient);
+      const translations = getTranslations(ingredient);
+      terms.exclude.push(...translations);
+    }
+  }
+  
+  // 2. NEGATİF CÜMLE: "tavuk içermesin", "patates yok"
+  const negativeRegex = new RegExp(
+    `([\\wğüşıöçĞÜŞİÖÇ]{3,})\\s*(${negativeWords.join('|')})`,
+    'gi'
+  );
+  
+  while ((match = negativeRegex.exec(msg)) !== null) {
+    const ingredient = match[1].toLowerCase();
+    const stopWords = ['bir', 'bu', 'şu', 'ne', 'var', 'mi', 'mı', 'için', 'ürün', 'urun'];
+    
+    if (ingredient.length > 2 && !stopWords.includes(ingredient)) {
+      terms.exclude.push(ingredient);
+      const translations = getTranslations(ingredient);
+      terms.exclude.push(...translations);
+    }
+  }
+  
+  // 3. "X-FREE": "grain-free", "gluten-free"
+  if (msg.includes('grain-free') || msg.includes('grain free') || msg.includes('tahılsız')) {
+    terms.exclude.push('tahıl', 'grain', 'buğday', 'wheat', 'mısır', 'corn', 'arpa', 'barley');
+  }
+  if (msg.includes('gluten-free') || msg.includes('gluten free') || msg.includes('glutensiz')) {
+    terms.exclude.push('gluten', 'glüten', 'buğday', 'wheat');
+  }
+  if (msg.includes('dairy-free') || msg.includes('dairy free')) {
+    terms.exclude.push('süt', 'dairy', 'milk', 'peynir', 'cheese', 'yoğurt', 'yogurt');
+  }
+  
+  // 4. "AZ X": "az tavuk", "düşük tavuk"
+  const lowContentRegex = /(az|düşük|dusuk|low|minimum)\s+([\\wğüşıöçĞÜŞİÖÇ]{3,})/gi;
+  while ((match = lowContentRegex.exec(msg)) !== null) {
+    const ingredient = match[2].toLowerCase();
+    if (ingredient.length > 2 && ingredient !== 'içerik' && ingredient !== 'icerik') {
+      terms.exclude.push(ingredient);
+      const translations = getTranslations(ingredient);
+      terms.exclude.push(...translations);
+    }
+  }
+  
+  // Tekrarları temizle
+  terms.exclude = [...new Set(terms.exclude)];
+  
+  // Log
+  if (terms.exclude.length > 0) {
+    console.log(`🚫 Hariç tutulanlar: ${terms.exclude.join(', ')}`);
+  }
+
   // MARKA TESPİTİ
   const stopWords = [
     'var', 'mi', 'mı', 'için', 'lazim', 'lazım', 'ne', 'nedir', 
     'varmı', 'var mi', 'bir', 'bu', 'şu', 'o', 've', 'ile',
-    'çok', 'az', 'iyi', 'güzel', 'ucuz', 'pahalı', 'mnama', 'kuru'
+    'çok', 'az', 'iyi', 'güzel', 'ucuz', 'pahalı', 'mnama'
   ];
   
   const categoryWords = [
     'kedi', 'köpek', 'kopek', 'mama', 'ödül', 'odul', 'oyuncak', 
-    'yaş', 'yas', 'kuş', 'kus', 'treat', 'food'
+    'yaş', 'yas', 'kuş', 'kus', 'treat', 'food', 'kuru'
   ];
   
   const words = msg.split(' ').filter(w => 
     w.length > 2 && 
     !stopWords.includes(w) && 
-    !categoryWords.includes(w)
+    !categoryWords.includes(w) &&
+    !negativeWords.includes(w)
   );
   
-  terms.brandKeywords = words;
+  terms.brandKeywords = words.filter(w => !terms.exclude.includes(w));
 
   // Yaş aralığı
   const ageMatch = msg.match(/(\d+)\s*(yaş|yas|yaşında|yasinda|aylık|aylik)/);
@@ -408,6 +500,10 @@ function buildSearchTerms(message) {
   
   if (msg.includes('tahılsız') || msg.includes('tahilsiz') || msg.includes('grain free')) {
     terms.special.push('tahılsız', 'grain free', 'grainfree');
+    // Tahılsız = tahıl içermesin
+    if (!terms.exclude.includes('tahıl')) {
+      terms.exclude.push('tahıl', 'grain', 'buğday', 'wheat', 'mısır', 'corn');
+    }
   }
   
   // YAŞLI vs YAŞ MAMA
@@ -446,37 +542,98 @@ function buildSearchTerms(message) {
   return terms;
 }
 
+// İçerik çevirileri
+function getTranslations(ingredient) {
+  const translations = {
+    // Et türleri
+    'tavuk': ['chicken', 'tavuklu', 'poultry'],
+    'chicken': ['tavuk', 'tavuklu'],
+    'balık': ['fish', 'balıklı', 'salmon', 'somon', 'tuna', 'ton'],
+    'fish': ['balık', 'balıklı'],
+    'sığır': ['beef', 'dana', 'sığırlı'],
+    'beef': ['sığır', 'dana'],
+    'kuzu': ['lamb', 'kuzulu'],
+    'lamb': ['kuzu', 'kuzulu'],
+    'hindi': ['turkey', 'hindili'],
+    'turkey': ['hindi', 'hindili'],
+    'ördek': ['duck', 'ördekli'],
+    'domuz': ['pork', 'domuzlu'],
+    
+    // Tahıl ve karbonhidratlar
+    'tahıl': ['grain', 'tahıllı', 'cereal'],
+    'grain': ['tahıl', 'tahıllı'],
+    'buğday': ['wheat', 'buğdaylı'],
+    'wheat': ['buğday', 'buğdaylı'],
+    'mısır': ['corn', 'mısırlı', 'maize'],
+    'corn': ['mısır', 'mısırlı'],
+    'pirinç': ['rice', 'pirinçli'],
+    'rice': ['pirinç', 'pirinçli'],
+    'patates': ['potato', 'patatesli'],
+    'potato': ['patates', 'patatesli'],
+    'soya': ['soy', 'soyalı', 'soybean'],
+    'soy': ['soya', 'soyalı'],
+    'arpa': ['barley', 'arpalı'],
+    'yulaf': ['oat', 'yulaflı'],
+    
+    // Süt ürünleri
+    'süt': ['milk', 'dairy', 'sütlü'],
+    'milk': ['süt', 'sütlü'],
+    'dairy': ['süt', 'süt ürünü'],
+    'peynir': ['cheese', 'peynirli'],
+    'yoğurt': ['yogurt', 'yoğurtlu'],
+    
+    // Diğer
+    'gluten': ['glüten'],
+    'glüten': ['gluten'],
+    'yumurta': ['egg', 'yumurtalı'],
+    'egg': ['yumurta', 'yumurtalı']
+  };
+  
+  return translations[ingredient.toLowerCase()] || [];
+}
+
 function smartFilter(products, searchTerms, originalMessage) {
   const msg = originalMessage.toLowerCase();
   
   const filtered = products.filter(p => {
     let score = 0;
     const titleLower = p.title.toLowerCase();
-    const descLower = p.description.toLowerCase();
+    const descLower = p.description.toLowerCase(); // TAM AÇIKLAMA!
     const vendorLower = p.vendor.toLowerCase();
     const allTags = p.tags.map(t => t.toLowerCase()).join(' ');
     const productTypeLower = p.productType.toLowerCase();
     const combined = titleLower + ' ' + allTags + ' ' + productTypeLower + ' ' + descLower;
 
-    // 1. MARKA KONTROLÜ (VENDOR + TITLE) - EN YÜKSEK ÖNCELİK!
+    // 0. NEGATİF FİLTRELEME - EN ÖNCELİKLİ!
+    if (searchTerms.exclude.length > 0) {
+      let excludeMatches = 0;
+      let foundExcludes = [];
+      
+      searchTerms.exclude.forEach(excludeWord => {
+        if (combined.includes(excludeWord)) {
+          excludeMatches++;
+          foundExcludes.push(excludeWord);
+        }
+      });
+      
+      if (excludeMatches > 0) {
+        score -= 100; // Yüksek ceza
+        console.log(`⛔ "${p.title.substring(0, 40)}" - İçeriyor: ${foundExcludes.join(', ')}`);
+      }
+    }
+
+    // 1. MARKA KONTROLÜ (VENDOR + TITLE)
     if (searchTerms.brandKeywords.length > 0) {
       searchTerms.brandKeywords.forEach(keyword => {
-        // A) Vendor alanında eşleşme (ideal)
         if (vendorLower && vendorLower === keyword) {
-          score += 50; // TAM EŞLEŞME
+          score += 50;
         } else if (vendorLower && (vendorLower.includes(keyword) || keyword.includes(vendorLower))) {
-          score += 45; // KISMI EŞLEŞME
-        }
-        // B) TITLE'da marka adı geçiyor (vendor boş veya farklıysa)
-        else if (titleLower.includes(keyword)) {
-          score += 48; // YÜKSEK PUAN - Title'dan marka bul
-        }
-        // C) Tag'de geçiyor
-        else if (allTags.includes(keyword)) {
+          score += 45;
+        } else if (titleLower.includes(keyword)) {
+          score += 48;
+        } else if (allTags.includes(keyword)) {
           score += 15;
-        }
-        // D) Description'da geçiyor
-        else if (descLower.includes(keyword)) {
+        } else if (descLower.includes(keyword)) {
           score += 10;
         }
       });
@@ -539,7 +696,7 @@ function smartFilter(products, searchTerms, originalMessage) {
       score += 3;
     }
 
-    return score > 0;
+    return score > 0; // Sadece pozitif skorlu ürünler
   })
   .sort((a, b) => {
     const scoreA = calculateScore(a, searchTerms, originalMessage);
@@ -547,7 +704,7 @@ function smartFilter(products, searchTerms, originalMessage) {
     return scoreB - scoreA;
   });
 
-  // ÇEŞİTLİLİK KAPALI - DOĞRUDAN EN YÜKSEK SKORLU ÜRÜNLER
+  // Debug logging
   console.log(`🎯 İlk 5 ürün skorları:`);
   filtered.slice(0, 5).forEach((p, i) => {
     const score = calculateScore(p, searchTerms, originalMessage);
@@ -561,11 +718,21 @@ function calculateScore(product, searchTerms, originalMessage) {
   let score = 0;
   const titleLower = product.title.toLowerCase();
   const vendorLower = product.vendor.toLowerCase();
+  const descLower = product.description.toLowerCase();
   const allTags = product.tags.map(t => t.toLowerCase()).join(' ');
   const productTypeLower = product.productType.toLowerCase();
-  const combined = titleLower + ' ' + allTags + ' ' + productTypeLower;
+  const combined = titleLower + ' ' + allTags + ' ' + productTypeLower + ' ' + descLower;
 
-  // Vendor + Title
+  // 0. NEGATİF FİLTRELEME
+  if (searchTerms.exclude.length > 0) {
+    searchTerms.exclude.forEach(excludeWord => {
+      if (combined.includes(excludeWord)) {
+        score -= 100;
+      }
+    });
+  }
+
+  // 1. Vendor + Title
   searchTerms.brandKeywords.forEach(keyword => {
     if (vendorLower && vendorLower === keyword) {
       score += 50;
@@ -576,24 +743,24 @@ function calculateScore(product, searchTerms, originalMessage) {
     }
   });
 
-  // Hayvan
+  // 2. Hayvan
   if (searchTerms.animal && combined.includes(searchTerms.animal)) {
     score += 20;
   }
 
-  // Kategori
+  // 3. Kategori
   if (searchTerms.category && combined.includes(searchTerms.category)) {
     score += 15;
   }
 
-  // Serbest metin
+  // 4. Serbest metin
   searchTerms.freeText.forEach(keyword => {
     if (combined.includes(keyword)) {
       score += 15;
     }
   });
 
-  // Özel
+  // 5. Özel
   searchTerms.special.forEach(keyword => {
     if (combined.includes(keyword)) {
       score += 10;
@@ -603,62 +770,41 @@ function calculateScore(product, searchTerms, originalMessage) {
   return score;
 }
 
-function diversifyProducts(products) {
-  if (products.length <= 12) return products;
+function generateSystemPrompt(products, domain, searchTerms) {
+  // Hariç tutulan içerikleri AI'ya bildir
+  const excludeWarning = searchTerms.exclude.length > 0 
+    ? `\n⚠️ KULLANICI ŞU İÇERİKLERİ İSTEMİYOR: ${searchTerms.exclude.join(', ')}\nBu içerikleri içeren ürünleri ASLA önerme!\n`
+    : '';
 
-  const sorted = [...products].sort((a, b) => {
-    const priceA = parseFloat(a.priceRange.minVariantPrice.amount);
-    const priceB = parseFloat(b.priceRange.minVariantPrice.amount);
-    return priceA - priceB;
-  });
-
-  const third = Math.floor(sorted.length / 3);
-  const cheap = sorted.slice(0, third);
-  const mid = sorted.slice(third, third * 2);
-  const expensive = sorted.slice(third * 2);
-
-  const diversified = [];
-  
-  diversified.push(...shuffleArray(cheap).slice(0, 4));
-  diversified.push(...shuffleArray(mid).slice(0, 4));
-  diversified.push(...shuffleArray(expensive).slice(0, 4));
-
-  return shuffleArray(diversified);
-}
-
-function shuffleArray(array) {
-  const shuffled = [...array];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
-  return shuffled;
-}
-
-function generateSystemPrompt(products, domain) {
   return `Sen Laylapet'in AI danışmanısın! 🐾 Türkçe konuş, profesyonel ama samimi ol.
-
+${excludeWarning}
 MEVCUT ÜRÜNLER (${products.length} adet - ÇEŞİTLİ FİYAT VE MARKA SEÇENEKLERDEN):
 ${products.map((p, i) => `
 ${i + 1}. **${p.title}**
    🏷️ Marka: ${p.vendor || 'Belirtilmemiş'}
    💰 ${parseFloat(p.priceRange.minVariantPrice.amount).toFixed(2)} TL
    📦 ${p.productType}
+   📝 ${p.descriptionShort}${p.description.length > 150 ? '...' : ''}
    🔗 https://${domain}/products/${p.handle}
 `).join('\n')}
 
 KURALLAR:
 1. Maksimum 3 ürün öner
-2. Marka bilgilerini vurgula
-3. ÇEŞİTLİLİK SAĞLA: Farklı fiyat aralıkları ve markalardan seç
-4. Her ürün için kısa açıklama yap
-5. Fiyatları belirt ve karşılaştır
-6. Link ver: [Ürün Adı](URL)
-7. Emoji kullan (🐱 🐶 ⭐ 💝)
-8. Maksimum 200 kelime
-9. Kullanıcı marka belirttiyse, o markayı ÖNCELİKLE öner
+2. Ürün açıklamalarını dikkate al (içerik, yüzde oranları)
+3. ${excludeWarning ? '⚠️ HARİÇ TUTULAN İÇERİKLERİ ASLA ÖNERME!' : ''}
+4. Kullanıcı "X içermesin/yok/olmadan" dediyse, o içeriği içeren ürünleri ASLA önerme
+5. Marka bilgilerini vurgula
+6. ÇEŞİTLİLİK SAĞLA: Farklı fiyat ve içerik seçenekleri sun
+7. Her ürün için kısa açıklama yap (neden uygun, içeriği ne)
+8. Fiyatları belirt ve karşılaştır
+9. Link ver: [Ürün Adı](URL)
+10. Emoji kullan (🐱 🐶 ⭐ 💝 ✅)
+11. Maksimum 200 kelime
 
-ÖNEMLİ: Sadece yukarıdaki ürünlerden öner! Marka ve fiyat çeşitliliğine dikkat et!`;
+ÖNEMLİ: 
+- Sadece yukarıdaki ürünlerden öner!
+- Kullanıcının istediği içeriklere sahip ürünleri öner!
+- İçerik bilgilerini açıklamadan oku ve belirt!`;
 }
 
 function extractProducts(reply, allProducts, sessionId = 'default') {
