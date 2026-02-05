@@ -30,7 +30,7 @@ app.post('/api/chat', async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Shopify-Storefront-Access-Token': process.env.SHOPIFY_TOKEN
+        'X-Shopify-Access-Token': process.env.SHOPIFY_TOKEN
       },
       body: JSON.stringify({
         query: `
