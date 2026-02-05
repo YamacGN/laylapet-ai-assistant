@@ -547,8 +547,12 @@ function smartFilter(products, searchTerms, originalMessage) {
     return scoreB - scoreA;
   });
 
-  return diversifyProducts(filtered);
-}
+  // ÇEŞİTLİLİK KAPALI (TEST İÇİN)
+  return filtered;
+  
+  // Eğer çeşitlilik istersen, bunu aç:
+  // return diversifyProducts(filtered);
+}}
 
 function calculateScore(product, searchTerms, originalMessage) {
   let score = 0;
